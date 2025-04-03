@@ -1,0 +1,195 @@
+diff --git a/client/checks.go b/client/checks.go
+index b8e092b..62e100d 100644
+--- a/client/checks.go
++++ b/client/checks.go
+@@ -16,6 +16,10 @@ package client
+ 
+ import (
+ 	"context"
++	"bytes"
++	"context"
++	"encoding/json"
++	"fmt"
+ 	"net/url"
+ )
+ 
+@@ -100,3 +104,29 @@ func (client *Client) Checks(opts *ChecksOptions) ([]*CheckInfo, error) {
+ 	}
+ 	return checks, nil
+ }
++
++type CheckPayload struct {
++	Action string
++	Check  string
++}
++
++// RunCheck runs a specific health check immediately and return the status.
++func (client *Client) RunCheck(opts *CheckPayload) (string, error) {
++	body, err := json.Marshal(opts)
++	if err != nil {
++		return "", fmt.Errorf("cannot marshal checks payload: %w", err)
++	}
++
++	resp, err := client.Requester().Do(context.Background(), &RequestOptions{
++		Type:   SyncRequest,
++		Method: "POST",
++		Path:   "/v1/checks",
++		Body:   bytes.NewBuffer(body),
++	})
++	if err != nil {
++		return "", err
++	}
++	var status string
++	err = resp.DecodeResult(&status)
++	return status, err
++}
+diff --git a/internals/cli/cmd_run-check.go b/internals/cli/cmd_run-check.go
+new file mode 100644
+index 0000000..5d85094
+--- /dev/null
++++ b/internals/cli/cmd_run-check.go
+@@ -0,0 +1,64 @@
++// Copyright (c) 2024 Canonical Ltd
++//
++// This program is free software: you can redistribute it and/or modify
++// it under the terms of the GNU General Public License version 3 as
++// published by the Free Software Foundation.
++//
++// This program is distributed in the hope that it will be useful,
++// but WITHOUT ANY WARRANTY; without even the implied warranty of
++// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++// GNU General Public License for more details.
++//
++// You should have received a copy of the GNU General Public License
++// along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++package cli
++
++import (
++	"fmt"
++
++	"github.com/canonical/go-flags"
++
++	"github.com/canonical/pebble/client"
++)
++
++const cmdCheckSummary = "Run check immediately and get the status"
++const cmdCheckDescription = `
++The check command runs a check immediately and return the status.
++`
++
++type cmdCheck struct {
++	client *client.Client
++
++	Positional struct {
++		Check string `positional-arg-name:"<check>" required:"1"`
++	} `positional-args:"yes"`
++}
++
++func init() {
++	AddCommand(&CmdInfo{
++		Name:        "run-check",
++		Summary:     cmdCheckSummary,
++		Description: cmdCheckDescription,
++		New: func(opts *CmdOptions) flags.Commander {
++			return &cmdCheck{client: opts.Client}
++		},
++	})
++}
++
++func (cmd *cmdCheck) Execute(args []string) error {
++	if len(args) > 0 {
++		return ErrExtraArgs
++	}
++
++	opts := client.CheckPayload{
++		Action: "run",
++		Check:  cmd.Positional.Check,
++	}
++	status, err := cmd.client.RunCheck(&opts)
++	if err != nil {
++		return err
++	}
++	fmt.Fprintln(Stdout, status)
++	return nil
++}
+diff --git a/internals/daemon/api.go b/internals/daemon/api.go
+index e6c6de1..bb6cb09 100644
+--- a/internals/daemon/api.go
++++ b/internals/daemon/api.go
+@@ -89,9 +89,11 @@ var API = []*Command{{
+ 	WriteAccess: AdminAccess{},
+ 	POST:        v1PostSignals,
+ }, {
+-	Path:       "/v1/checks",
+-	ReadAccess: UserAccess{},
+-	GET:        v1GetChecks,
++	Path:        "/v1/checks",
++	ReadAccess:  UserAccess{},
++	WriteAccess: UserAccess{},
++	GET:         v1GetChecks,
++	POST:        v1PostChecks,
+ }, {
+ 	Path:        "/v1/notices",
+ 	ReadAccess:  UserAccess{},
+diff --git a/internals/daemon/api_checks.go b/internals/daemon/api_checks.go
+index 10dc45b..64eb838 100644
+--- a/internals/daemon/api_checks.go
++++ b/internals/daemon/api_checks.go
+@@ -15,6 +15,7 @@
+ package daemon
+ 
+ import (
++	"encoding/json"
+ 	"net/http"
+ 
+ 	"github.com/canonical/x-go/strutil"
+@@ -66,3 +67,34 @@ func v1GetChecks(c *Command, r *http.Request, _ *UserState) Response {
+ 	}
+ 	return SyncResponse(infos)
+ }
++
++func v1PostChecks(c *Command, r *http.Request, _ *UserState) Response {
++	var payload struct {
++		Action string `json:"action"`
++		Check  string `json:"check"`
++	}
++	decoder := json.NewDecoder(r.Body)
++	if err := decoder.Decode(&payload); err != nil {
++		return BadRequest("cannot decode data from request body: %v", err)
++	}
++	switch payload.Action {
++	case "run":
++		if payload.Check == "" {
++			return BadRequest("no check to %s provided", payload.Action)
++		}
++
++		check, ok := c.d.overlord.PlanManager().Plan().Checks[payload.Check]
++		if !ok {
++			return SyncResponse("check not found")
++		}
++
++		err := c.d.overlord.CheckManager().RunCheck(r.Context(), check)
++		if err != nil {
++			return SyncResponse(err)
++		}
++		return SyncResponse("check passed")
++
++	default:
++		return BadRequest("action %s not supported", payload.Action)
++	}
++}
+diff --git a/internals/overlord/checkstate/handlers.go b/internals/overlord/checkstate/handlers.go
+index a087d5a..2fcfe28 100644
+--- a/internals/overlord/checkstate/handlers.go
++++ b/internals/overlord/checkstate/handlers.go
+@@ -184,3 +184,9 @@ func pluralise(n int, singular, plural string) string {
+ 	}
+ 	return fmt.Sprintf("%d %s", n, plural)
+ }
++
++func (m *CheckManager) RunCheck(ctx context.Context, check *plan.Check) error {
++	logger.Debugf("Performing check %q", check.Name)
++	chk := newChecker(check)
++	return runCheck(ctx, chk, check.Timeout.Value)
++}

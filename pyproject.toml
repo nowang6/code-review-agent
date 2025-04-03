@@ -1,23 +1,16 @@
 [project]
 name = "code-review-agent"
 version = "0.1.0"
-description = ""
-authors = [
-    {name = "wangning2",email = "wangning2@nantian.com.cn"}
-]
+description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.9,<4.0"
+requires-python = ">=3.12"
 dependencies = [
-    "langchain-core>=0.1.0",
-    "langchain>=0.1.0",
-    "langchain-openai>=0.0.1",
-    "python-dotenv>=1.0.0"
+    "dotenv>=0.9.9",
+    "openai>=1.70.0",
 ]
 
-[tool.poetry]
-packages = [{include = "code_review_agent", from = "src"}]
 
-
-[build-system]
-requires = ["poetry-core>=2.0.0,<3.0.0"]
-build-backend = "poetry.core.masonry.api"
+[[tool.uv.index]]
+name = "tsinghua"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple/"
+priority = "primary"
